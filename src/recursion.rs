@@ -5,6 +5,7 @@ use crate::{op, DebouncedEvent, RawEvent, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::fs::FileType;
 use std::iter::Iterator;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
@@ -19,7 +20,7 @@ struct RecursionFilter {
     follow_links: bool,
 }
 
-trait Event {
+pub trait Event {
     fn new_create(path: impl Into<PathBuf>) -> Self;
     fn is_dir_create(&self) -> Option<&Path>;
 }
@@ -56,9 +57,11 @@ impl Event for RawEvent {
     }
 }
 
-trait WatcherInternal<E: Event> {
-    fn add_single_watch(&mut self, path: &Path);
-    fn remove_single_watch(&mut self, path: &Path);
+pub trait WatcherInternal<E: Event> {
+    /// If it returns `None` it means it's not supported (natively)
+    fn add_recursive_watch(&mut self, dir: &Path) -> Option<()>;
+    fn add_non_recursive_watch(&mut self, dir: &Path);
+    fn remove_non_recursive_watch(&mut self, dir: &Path);
     fn send(&self, event: E);
 }
 
@@ -67,24 +70,14 @@ struct NestedWatches {
     paths: HashSet<PathBuf>,
 }
 
-struct RecursionAdapter {
-    roots: HashMap<PathBuf, NestedWatches>,
-}
-
-impl RecursionAdapter {
-    pub fn handle_event<E: Event>(&mut self, ev: E, watcher: &mut impl WatcherInternal<E>) {
-        let dir = match ev.is_dir_create() {
-            None => return,
-            Some(dir) => dir,
-        };
-        let nested = match self.find_root(&dir) {
-            None => {
-                // error?
-                return;
-            }
-            Some(x) => x,
-        };
-        match &nested.mode {
+impl NestedWatches {
+    fn add_watch<E: Event>(
+        &mut self,
+        dir: &Path,
+        watcher: &mut impl WatcherInternal<E>,
+        emit_for_contents: bool,
+    ) {
+        match &self.mode {
             RecursiveMode::Filtered(filter) => {
                 for e in WalkDir::new(dir)
                     .follow_links(filter.follow_links)
@@ -99,38 +92,75 @@ impl RecursionAdapter {
                     .filter_map(|e| e.ok())
                 {
                     if e.file_type().is_dir() {
-                        nested.paths.insert(e.path().to_path_buf());
-                        watcher.add_single_watch(e.path());
+                        self.paths.insert(e.path().to_path_buf());
+                        watcher.add_non_recursive_watch(e.path());
                     }
-
-                    watcher.send(E::new_create(e.into_path()));
+                    if emit_for_contents {
+                        watcher.send(E::new_create(e.into_path()));
+                    }
                 }
             }
             RecursiveMode::Recursive => {
-                // TODO do nothing if native recursion is supported
-                for e in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
-                    if e.file_type().is_dir() {
-                        nested.paths.insert(e.path().to_path_buf());
-                        watcher.add_single_watch(e.path());
+                if watcher.add_recursive_watch(dir).is_some() {
+                    // is supported
+                } else {
+                    // simulate it
+                    for e in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+                        if e.file_type().is_dir() {
+                            self.paths.insert(e.path().to_path_buf());
+                            watcher.add_non_recursive_watch(e.path());
+                        }
+                        if emit_for_contents {
+                            watcher.send(E::new_create(e.into_path()));
+                        }
                     }
-
-                    watcher.send(E::new_create(e.into_path()));
                 }
             }
             RecursiveMode::NonRecursive => {}
         }
     }
+}
 
-    pub fn add_root(&mut self, path: PathBuf, mode: RecursiveMode) {
-        // TODO what if `path` already exists with a different `RecursiveMode`
-        self.roots.entry(path).or_insert_with(|| NestedWatches {
-            mode,
-            paths: HashSet::new(),
-        });
+struct RecursionAdapter<E: Event> {
+    roots: HashMap<PathBuf, NestedWatches>,
+    _event_type: PhantomData<E>,
+}
+
+impl<E: Event> RecursionAdapter<E> {
+    pub fn handle_event(&mut self, ev: E, watcher: &mut impl WatcherInternal<E>) {
+        if let Some(dir) = ev.is_dir_create() {
+            if let Some(nested) = self.find_root(dir) {
+                nested.add_watch(dir, watcher, true);
+            }
+        }
     }
 
-    pub fn remove_root(&mut self, path: &Path) -> HashSet<PathBuf> {
-        self.roots.remove(path).map(|x| x.paths).unwrap_or_default()
+    pub fn add_root(
+        &mut self,
+        path: PathBuf,
+        mode: RecursiveMode,
+        watcher: &mut impl WatcherInternal<E>,
+    ) {
+        // TODO what if `path` already exists with a different `RecursiveMode`
+        if self.roots.contains_key(&path) {
+            return;
+        }
+
+        let mut nested = NestedWatches {
+            mode,
+            paths: HashSet::new(),
+        };
+        nested.add_watch(&path, watcher, false);
+
+        self.roots.insert(path, nested);
+    }
+
+    pub fn remove_root(&mut self, path: &Path, watcher: &mut impl WatcherInternal<E>) {
+        if let Some(nested) = self.roots.remove(path) {
+            for path in nested.paths.iter() {
+                watcher.remove_non_recursive_watch(path);
+            }
+        }
     }
 
     fn find_root(&mut self, path: &Path) -> Option<&mut NestedWatches> {

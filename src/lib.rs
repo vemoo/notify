@@ -133,6 +133,7 @@ pub mod null;
 pub mod poll;
 
 mod debounce;
+mod filter;
 
 /// Contains the `Op` type which describes the actions for an event.
 ///

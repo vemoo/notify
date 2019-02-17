@@ -8,6 +8,7 @@ use std::fs;
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy)]
 enum Action {
     Watch,
     Unwatch,
@@ -72,6 +73,7 @@ impl RootWatch {
     ) {
         match &self.mode {
             RecursiveMode::Filtered(filter) => {
+                self.paths.insert(dir.to_path_buf());
                 watcher.add_non_recursive_watch(dir, is_root);
                 for e in WalkDir::new(dir)
                     .min_depth(1)
@@ -96,6 +98,7 @@ impl RootWatch {
                 }
             }
             RecursiveMode::Recursive => {
+                self.paths.insert(dir.to_path_buf());
                 if watcher.add_recursive_watch(dir).is_some() {
                     // is supported
                 } else {
@@ -116,7 +119,12 @@ impl RootWatch {
                     }
                 }
             }
-            RecursiveMode::NonRecursive => {}
+            RecursiveMode::NonRecursive => {
+                if is_root {
+                    self.paths.insert(dir.to_path_buf());
+                    watcher.add_non_recursive_watch(dir, false);
+                }
+            }
         }
     }
 
@@ -147,13 +155,13 @@ impl RecursionAdapter {
 
     pub fn handle_event(&mut self, ev: RawEvent, watcher: &mut impl WatcherInternal) {
         if let Some((action, dir)) = event_action(&ev) {
+            // find containing root
             if let Some(nested) = self.find_root(dir) {
                 match action {
                     Action::Watch => {
                         nested.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
                     }
                     Action::Unwatch => {
-                        // println!("UNWATCH: {:?}", ev);
                         nested.remove_watch(dir, watcher);
                     }
                 }
@@ -189,10 +197,14 @@ impl RecursionAdapter {
 
     pub fn remove_root(&mut self, path: &Path, watcher: &mut impl WatcherInternal) -> Result<()> {
         if let Some(nested) = self.roots.remove(path) {
-            for path in nested.paths.iter() {
-                watcher.remove_non_recursive_watch(path);
+            if nested.paths.is_empty() {
+                Err(Error::WatchNotFound)
+            } else {
+                for path in nested.paths.iter() {
+                    watcher.remove_non_recursive_watch(path);
+                }
+                Ok(())
             }
-            Ok(())
         } else {
             Err(Error::WatchNotFound)
         }

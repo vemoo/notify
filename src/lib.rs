@@ -525,21 +525,32 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Options for filtered recursion mode
+pub struct RecursionFilter {
+    /// Watch only directories that match this predicate
+    pub filter_dir: Box<Fn(&Path) -> bool + Send>,
+    /// Whether the watcher should also desdend into links
+    pub follow_links: bool,
+}
+
 /// Indicates whether only the provided directory or its sub-directories as well should be watched
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum RecursiveMode {
     /// Watch all sub-directories as well, including directories created after installing the watch
     Recursive,
 
     /// Watch only the provided directory
     NonRecursive,
+
+    /// Watch recursively excluding some directories and their sub-directories
+    Filtered(RecursionFilter),
 }
 
+// TODO remove this
 impl RecursiveMode {
     fn is_recursive(&self) -> bool {
         match *self {
             RecursiveMode::Recursive => true,
-            RecursiveMode::NonRecursive => false,
+            _ => false,
         }
     }
 }

@@ -8,30 +8,31 @@ use std::fs;
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
-    Watch,
-    Unwatch,
+    Create,
+    Remove,
+    RenameFrom,
 }
 
 fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
     let path = ev.path.as_ref()?;
     let op = ev.op.as_ref().ok()?;
     if op.contains(op::REMOVE) {
-        Some((Action::Unwatch, path))
+        Some((Action::Remove, path))
     } else {
         let is_dir = fs::metadata(path).ok().map(|m| m.is_dir());
         if op.contains(op::CREATE) {
             if is_dir == Some(true) {
-                Some((Action::Watch, path))
+                Some((Action::Create, path))
             } else {
                 None
             }
         } else if op.contains(op::RENAME) {
             if is_dir.is_none() {
-                Some((Action::Unwatch, path))
+                Some((Action::RenameFrom, path))
             } else if is_dir == Some(true) {
-                Some((Action::Watch, path))
+                Some((Action::Create, path))
             } else {
                 None
             }
@@ -140,6 +141,12 @@ impl RootWatch {
             self.paths.remove(&path);
         }
     }
+
+    fn remove_all(self, watcher: &mut impl WatcherInternal) {
+        for path in &self.paths {
+            watcher.remove_non_recursive_watch(&path);
+        }
+    }
 }
 
 pub struct RecursionAdapter {
@@ -155,14 +162,24 @@ impl RecursionAdapter {
 
     pub fn handle_event(&mut self, ev: RawEvent, watcher: &mut impl WatcherInternal) {
         if let Some((action, dir)) = event_action(&ev) {
-            // find containing root
-            if let Some(nested) = self.find_root(dir) {
-                match action {
-                    Action::Watch => {
-                        nested.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
-                    }
-                    Action::Unwatch => {
-                        nested.remove_watch(dir, watcher);
+            // special case of removing root
+            let mut handled = false;
+            if action == Action::Remove {
+                if let Some(nested) = self.roots.remove(dir) {
+                    nested.remove_all(watcher);
+                    handled = true;
+                }
+            }
+            if !handled {
+                // find containing root
+                if let Some(nested) = self.find_root(dir) {
+                    match action {
+                        Action::Create => {
+                            nested.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
+                        }
+                        Action::Remove | Action::RenameFrom => {
+                            nested.remove_watch(dir, watcher);
+                        }
                     }
                 }
             }
@@ -200,9 +217,7 @@ impl RecursionAdapter {
             if nested.paths.is_empty() {
                 Err(Error::WatchNotFound)
             } else {
-                for path in nested.paths.iter() {
-                    watcher.remove_non_recursive_watch(path);
-                }
+                nested.remove_all(watcher);
                 Ok(())
             }
         } else {
@@ -212,9 +227,7 @@ impl RecursionAdapter {
 
     pub fn remove_all(&mut self, watcher: &mut impl WatcherInternal) {
         for (_p, r) in self.roots.drain() {
-            for path in r.paths.iter() {
-                watcher.remove_non_recursive_watch(path);
-            }
+            r.remove_all(watcher);
         }
     }
 

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
-    Create,
+    Add,
     Remove,
     RenameFrom,
 }
@@ -24,7 +24,7 @@ fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
         let is_dir = fs::metadata(path).ok().map(|m| m.is_dir());
         if op.contains(op::CREATE) {
             if is_dir == Some(true) {
-                Some((Action::Create, path))
+                Some((Action::Add, path))
             } else {
                 None
             }
@@ -32,8 +32,9 @@ fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
             if is_dir.is_none() {
                 Some((Action::RenameFrom, path))
             } else if is_dir == Some(true) {
-                Some((Action::Create, path))
+                Some((Action::Add, path))
             } else {
+                // if it's a file we shouldn't do anything for renames
                 None
             }
         } else {
@@ -52,15 +53,18 @@ fn new_create(path: impl Into<PathBuf>) -> RawEvent {
 
 // TODO return Result
 pub trait WatcherInternal {
-    /// If it returns `None` it means it's not supported (natively)
-    fn add_recursive_watch(&mut self, dir: &Path) -> Option<()>;
+    /// If it returns `false` it means it's not natively supported
+    fn add_recursive_watch(&mut self, dir: &Path) -> bool;
     fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool);
     fn remove_non_recursive_watch(&mut self, dir: &Path);
     fn send(&mut self, event: RawEvent);
 }
 
+/// A watch added by the user
+/// Should contain the root path in `paths`
 struct RootWatch {
     mode: RecursiveMode,
+    is_native_recursive: bool,
     paths: HashSet<PathBuf>,
 }
 
@@ -99,11 +103,9 @@ impl RootWatch {
                 }
             }
             RecursiveMode::Recursive => {
-                self.paths.insert(dir.to_path_buf());
-                if watcher.add_recursive_watch(dir).is_some() {
-                    // is supported
-                } else {
+                if !self.is_native_recursive {
                     // simulate it
+                    self.paths.insert(dir.to_path_buf());
                     watcher.add_non_recursive_watch(dir, is_root);
                     for e in WalkDir::new(dir)
                         .min_depth(1)
@@ -123,7 +125,7 @@ impl RootWatch {
             RecursiveMode::NonRecursive => {
                 if is_root {
                     self.paths.insert(dir.to_path_buf());
-                    watcher.add_non_recursive_watch(dir, false);
+                    watcher.add_non_recursive_watch(dir, is_root);
                 }
             }
         }
@@ -162,23 +164,27 @@ impl RecursionAdapter {
 
     pub fn handle_event(&mut self, ev: RawEvent, watcher: &mut impl WatcherInternal) {
         if let Some((action, dir)) = event_action(&ev) {
-            // special case of removing root
-            let mut handled = false;
-            if action == Action::Remove {
-                if let Some(nested) = self.roots.remove(dir) {
-                    nested.remove_all(watcher);
-                    handled = true;
+            // special case for root
+            if self.roots.contains_key(dir) {
+                // if it's a `Action::RenameFrom` we still want to watch it
+                // and `Action::Create` shouldn't happen
+                if action == Action::Remove {
+                    // ok to unwrap because of `contains_key` check
+                    let root_watch = self.roots.remove(dir).unwrap();
+                    root_watch.remove_all(watcher);
                 }
-            }
-            if !handled {
+            } else {
                 // find containing root
-                if let Some(nested) = self.find_root(dir) {
+                if let Some(root_watch) = self.find_root(dir) {
                     match action {
-                        Action::Create => {
-                            nested.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
+                        Action::Add => {
+                            root_watch.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
                         }
                         Action::Remove | Action::RenameFrom => {
-                            nested.remove_watch(dir, watcher);
+                            // If it's `Action::RenameFrom` remove watch
+                            // because it could have moved outside the root or not match the filter anymore
+                            // If we should still be watching it we will receive another event with `Action::Add`
+                            root_watch.remove_watch(dir, watcher);
                         }
                     }
                 }
@@ -199,25 +205,41 @@ impl RecursionAdapter {
             return Ok(());
         }
 
+        // ensure it exists
         let _ = fs::metadata(&path).map_err(Error::Io)?;
 
-        let mut nested = RootWatch {
+        let is_recursive = if let RecursiveMode::Recursive = mode {
+            true
+        } else {
+            false
+        };
+
+        let mut root_watch = RootWatch {
             mode,
+            is_native_recursive: false,
             paths: HashSet::new(),
         };
-        nested.add_watch(&path, watcher, true, false);
 
-        self.roots.insert(path, nested);
+        if is_recursive && watcher.add_recursive_watch(&path) {
+            root_watch.paths.insert(path.clone());
+            root_watch.is_native_recursive = true;
+        } else {
+            root_watch.add_watch(&path, watcher, true, false);
+        }
+
+        self.roots.insert(path, root_watch);
 
         Ok(())
     }
 
     pub fn remove_root(&mut self, path: &Path, watcher: &mut impl WatcherInternal) -> Result<()> {
-        if let Some(nested) = self.roots.remove(path) {
-            if nested.paths.is_empty() {
+        if let Some(root_watch) = self.roots.remove(path) {
+            if root_watch.paths.is_empty() {
+                // it should contain at least the root path
+                // otherwise it means that the root directory was removed
                 Err(Error::WatchNotFound)
             } else {
-                nested.remove_all(watcher);
+                root_watch.remove_all(watcher);
                 Ok(())
             }
         } else {

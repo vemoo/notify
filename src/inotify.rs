@@ -45,9 +45,9 @@ struct EventLoop {
 }
 
 impl WatcherInternal for EventLoop {
-    fn add_recursive_watch(&mut self, _dir: &Path) -> Option<()> {
+    fn add_recursive_watch(&mut self, _dir: &Path) -> bool {
         // not supported
-        None
+        false
     }
     fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool) {
         let _ = self.add_single_watch(dir.to_path_buf(), false, is_root);

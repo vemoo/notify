@@ -546,7 +546,7 @@ fn watch_recursive_move_out() {
 
     tdir.create("watch_dir/dir1a/dir1/file1");
     tdir.rename("watch_dir/dir1a", "dir1b");
-    sleep(10);
+    sleep(20);
     tdir.create("dir1b/dir1/file2");
 
     let actual = if cfg!(target_os = "windows") {

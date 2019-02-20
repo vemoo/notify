@@ -43,12 +43,11 @@ fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
     }
 }
 
-// TODO return Result
 pub(crate) trait WatcherInternal {
-    /// If it returns `false` it means it's not natively supported
-    fn add_recursive_watch(&mut self, dir: &Path) -> bool;
-    fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool);
-    fn remove_non_recursive_watch(&mut self, dir: &Path);
+    /// If it returns `Ok(false)` it means it's not natively supported
+    fn add_recursive_watch(&mut self, dir: &Path) -> Result<bool>;
+    fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool) -> Result<()>;
+    fn remove_non_recursive_watch(&mut self, dir: &Path) -> Result<()>;
 }
 
 /// A watch added by the user
@@ -60,10 +59,15 @@ struct RootWatch {
 }
 
 impl RootWatch {
-    fn add_watch(&mut self, dir: &Path, watcher: &mut impl WatcherInternal, is_root: bool) {
+    fn add_watch(
+        &mut self,
+        dir: &Path,
+        watcher: &mut impl WatcherInternal,
+        is_root: bool,
+    ) -> Result<()> {
         match &self.mode {
             RecursiveMode::Filtered(filter) => {
-                watcher.add_non_recursive_watch(dir, is_root);
+                watcher.add_non_recursive_watch(dir, is_root)?;
                 self.paths.insert(dir.to_path_buf());
                 for e in WalkDir::new(dir)
                     .min_depth(1)
@@ -72,14 +76,14 @@ impl RootWatch {
                     .filter_entry(|e| e.file_type().is_dir() && (filter.filter_dir)(e.path()))
                     .filter_map(|e| e.ok())
                 {
-                    watcher.add_non_recursive_watch(e.path(), false);
+                    watcher.add_non_recursive_watch(e.path(), false)?;
                     self.paths.insert(e.path().to_path_buf());
                 }
             }
             RecursiveMode::Recursive => {
                 if !self.is_native_recursive {
                     // simulate it
-                    watcher.add_non_recursive_watch(dir, is_root);
+                    watcher.add_non_recursive_watch(dir, is_root)?;
                     self.paths.insert(dir.to_path_buf());
                     for e in WalkDir::new(dir)
                         .min_depth(1)
@@ -87,7 +91,7 @@ impl RootWatch {
                         .filter_entry(|e| e.file_type().is_dir())
                         .filter_map(|e| e.ok())
                     {
-                        watcher.add_non_recursive_watch(e.path(), false);
+                        watcher.add_non_recursive_watch(e.path(), false)?;
                         self.paths.insert(e.path().to_path_buf());
                     }
                 }
@@ -95,13 +99,14 @@ impl RootWatch {
             RecursiveMode::NonRecursive => {
                 if is_root {
                     self.paths.insert(dir.to_path_buf());
-                    watcher.add_non_recursive_watch(dir, is_root);
+                    watcher.add_non_recursive_watch(dir, is_root)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn remove_watch(&mut self, dir: &Path, watcher: &mut impl WatcherInternal) {
+    fn remove_watch(&mut self, dir: &Path, watcher: &mut impl WatcherInternal) -> Result<()> {
         let mut remove_list = Vec::new();
         for path in &self.paths {
             if path.starts_with(dir) {
@@ -109,15 +114,17 @@ impl RootWatch {
             }
         }
         for path in remove_list {
-            watcher.remove_non_recursive_watch(&path);
+            watcher.remove_non_recursive_watch(&path)?;
             self.paths.remove(&path);
         }
+        Ok(())
     }
 
-    fn remove_all(self, watcher: &mut impl WatcherInternal) {
+    fn remove_all(self, watcher: &mut impl WatcherInternal) -> Result<()> {
         for path in &self.paths {
-            watcher.remove_non_recursive_watch(&path);
+            watcher.remove_non_recursive_watch(&path)?;
         }
+        Ok(())
     }
 }
 
@@ -132,7 +139,11 @@ impl RecursionAdapter {
         }
     }
 
-    pub fn handle_event(&mut self, ev: &RawEvent, watcher: &mut impl WatcherInternal) {
+    pub fn handle_event(
+        &mut self,
+        ev: &RawEvent,
+        watcher: &mut impl WatcherInternal,
+    ) -> Result<()> {
         if let Some((action, dir)) = event_action(ev) {
             // special case for root
             if self.roots.contains_key(dir) {
@@ -141,25 +152,27 @@ impl RecursionAdapter {
                 if action == Action::Remove {
                     // ok to unwrap because of `contains_key` check
                     let root_watch = self.roots.remove(dir).unwrap();
-                    root_watch.remove_all(watcher);
+                    root_watch.remove_all(watcher)?;
                 }
             } else {
                 // find containing root
                 if let Some(root_watch) = self.find_root(dir) {
                     match action {
                         Action::Add => {
-                            root_watch.add_watch(dir, watcher, false);
+                            root_watch.add_watch(dir, watcher, false)?;
                         }
                         Action::Remove | Action::RenameFrom => {
                             // If it's `Action::RenameFrom` remove watch
                             // because it could have moved outside the root or not match the filter anymore
                             // If we should still be watching it we will receive another event with `Action::Add`
-                            root_watch.remove_watch(dir, watcher);
+                            root_watch.remove_watch(dir, watcher)?;
                         }
                     }
                 }
             }
         }
+
+        Ok(())
     }
 
     pub fn add_root(
@@ -188,11 +201,11 @@ impl RecursionAdapter {
             paths: HashSet::new(),
         };
 
-        if is_recursive && watcher.add_recursive_watch(&path) {
+        if is_recursive && watcher.add_recursive_watch(&path)? {
             root_watch.paths.insert(path.clone());
             root_watch.is_native_recursive = true;
         } else {
-            root_watch.add_watch(&path, watcher, true);
+            root_watch.add_watch(&path, watcher, true)?;
         }
 
         self.roots.insert(path, root_watch);
@@ -207,7 +220,7 @@ impl RecursionAdapter {
                 // otherwise it means that the root directory was removed
                 Err(Error::WatchNotFound)
             } else {
-                root_watch.remove_all(watcher);
+                root_watch.remove_all(watcher)?;
                 Ok(())
             }
         } else {
@@ -215,10 +228,11 @@ impl RecursionAdapter {
         }
     }
 
-    pub fn remove_all(&mut self, watcher: &mut impl WatcherInternal) {
+    pub fn remove_all(&mut self, watcher: &mut impl WatcherInternal) -> Result<()> {
         for (_p, r) in self.roots.drain() {
-            r.remove_all(watcher);
+            r.remove_all(watcher)?;
         }
+        Ok(())
     }
 
     fn find_root(&mut self, path: &Path) -> Option<&mut RootWatch> {

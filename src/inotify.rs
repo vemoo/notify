@@ -45,15 +45,15 @@ struct EventLoop {
 }
 
 impl WatcherInternal for EventLoop {
-    fn add_recursive_watch(&mut self, _dir: &Path) -> bool {
+    fn add_recursive_watch(&mut self, _dir: &Path) -> Result<bool> {
         // not supported
-        false
+        Ok(false)
     }
-    fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool) {
-        let _ = self.add_single_watch(dir.to_path_buf(), false, is_root);
+    fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool) -> Result<()> {
+        self.add_single_watch(dir.to_path_buf(), false, is_root)
     }
-    fn remove_non_recursive_watch(&mut self, dir: &Path) {
-        let _ = self.remove_watch(dir.to_path_buf(), false);
+    fn remove_non_recursive_watch(&mut self, dir: &Path) -> Result<()> {
+        self.remove_watch(dir.to_path_buf(), false)
     }
 }
 
@@ -185,6 +185,14 @@ impl EventLoop {
 struct EventLoopWrapper {
     event_loop: EventLoop,
     recursion_adapter: RecursionAdapter,
+    events_buffer: Vec<RawEvent>,
+}
+
+fn send_event(recursion_adapter: &mut RecursionAdapter, event_loop: &mut EventLoop, ev: RawEvent) {
+    if let Err(_e) = recursion_adapter.handle_event(&ev, event_loop) {
+        // TODO log error?
+    }
+    event_loop.event_tx.send(ev);
 }
 
 impl EventLoopWrapper {
@@ -193,6 +201,7 @@ impl EventLoopWrapper {
         Ok(EventLoopWrapper {
             event_loop,
             recursion_adapter: RecursionAdapter::new(),
+            events_buffer: Vec::new(),
         })
     }
 
@@ -254,7 +263,9 @@ impl EventLoopWrapper {
                     );
                 }
                 EventLoopMsg::Shutdown => {
-                    self.recursion_adapter.remove_all(&mut self.event_loop);
+                    if let Err(_e) = self.recursion_adapter.remove_all(&mut self.event_loop) {
+                        // TODO log error?
+                    }
                     if let Some(inotify) = self.event_loop.inotify.take() {
                         let _ = inotify.close();
                     }
@@ -269,7 +280,7 @@ impl EventLoopWrapper {
                         if let Some(ev) =
                             check_pending_rename_event(&mut self.event_loop.rename_event)
                         {
-                            self.send_event(ev);
+                            send_event(&mut self.recursion_adapter, &mut self.event_loop, ev);
                         }
                     }
                 }
@@ -278,15 +289,13 @@ impl EventLoopWrapper {
     }
 
     fn handle_inotify(&mut self) {
-        let mut acc_events = Vec::new();
-
         if let Some(ref mut inotify) = self.event_loop.inotify {
             let mut buffer = [0; 1024];
             match inotify.read_events(&mut buffer) {
                 Ok(events) => {
                     for event in events {
                         if event.mask.contains(EventMask::Q_OVERFLOW) {
-                            acc_events.push(RawEvent {
+                            self.events_buffer.push(RawEvent {
                                 path: None,
                                 op: Ok(op::Op::RESCAN),
                                 cookie: None,
@@ -306,7 +315,7 @@ impl EventLoopWrapper {
                             if let Some(ev) =
                                 check_pending_rename_event(&mut self.event_loop.rename_event)
                             {
-                                acc_events.push(ev);
+                                self.events_buffer.push(ev);
                             }
                             self.event_loop.rename_event = Some(RawEvent {
                                 path: path,
@@ -321,7 +330,7 @@ impl EventLoopWrapper {
                                     mem::replace(&mut self.event_loop.rename_event, None);
                                 if let Some(e) = rename_event {
                                     if e.cookie == Some(event.cookie) {
-                                        acc_events.push(e);
+                                        self.events_buffer.push(e);
                                         o.insert(op::Op::RENAME);
                                         c = Some(event.cookie);
                                     } else {
@@ -356,10 +365,10 @@ impl EventLoopWrapper {
                                 if let Some(event) =
                                     check_pending_rename_event(&mut self.event_loop.rename_event)
                                 {
-                                    acc_events.push(event);
+                                    self.events_buffer.push(event);
                                 }
 
-                                acc_events.push(RawEvent {
+                                self.events_buffer.push(RawEvent {
                                     path: path,
                                     op: Ok(o),
                                     cookie: c,
@@ -385,7 +394,7 @@ impl EventLoopWrapper {
                     }
                 }
                 Err(e) => {
-                    acc_events.push(RawEvent {
+                    self.events_buffer.push(RawEvent {
                         path: None,
                         op: Err(Error::Io(e)),
                         cookie: None,
@@ -394,15 +403,9 @@ impl EventLoopWrapper {
             }
         }
 
-        for ev in acc_events {
-            self.send_event(ev);
+        for ev in self.events_buffer.drain(..) {
+            send_event(&mut self.recursion_adapter, &mut self.event_loop, ev);
         }
-    }
-
-    fn send_event(&mut self, event: RawEvent) {
-        self.recursion_adapter
-            .handle_event(&event, &mut self.event_loop);
-        self.event_loop.event_tx.send(event);
     }
 }
 

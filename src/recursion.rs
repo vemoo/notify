@@ -43,21 +43,12 @@ fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
     }
 }
 
-fn new_create(path: impl Into<PathBuf>) -> RawEvent {
-    RawEvent {
-        path: Some(path.into()),
-        op: Ok(op::CREATE),
-        cookie: None,
-    }
-}
-
 // TODO return Result
-pub trait WatcherInternal {
+pub(crate) trait WatcherInternal {
     /// If it returns `false` it means it's not natively supported
     fn add_recursive_watch(&mut self, dir: &Path) -> bool;
     fn add_non_recursive_watch(&mut self, dir: &Path, is_root: bool);
     fn remove_non_recursive_watch(&mut self, dir: &Path);
-    fn send(&mut self, event: RawEvent);
 }
 
 /// A watch added by the user
@@ -69,56 +60,35 @@ struct RootWatch {
 }
 
 impl RootWatch {
-    fn add_watch(
-        &mut self,
-        dir: &Path,
-        watcher: &mut impl WatcherInternal,
-        is_root: bool,
-        emit_for_contents: bool,
-    ) {
+    fn add_watch(&mut self, dir: &Path, watcher: &mut impl WatcherInternal, is_root: bool) {
         match &self.mode {
             RecursiveMode::Filtered(filter) => {
-                self.paths.insert(dir.to_path_buf());
                 watcher.add_non_recursive_watch(dir, is_root);
+                self.paths.insert(dir.to_path_buf());
                 for e in WalkDir::new(dir)
                     .min_depth(1)
                     .follow_links(filter.follow_links)
                     .into_iter()
-                    .filter_entry(|e| {
-                        if e.file_type().is_dir() {
-                            (filter.filter_dir)(e.path())
-                        } else {
-                            true
-                        }
-                    })
+                    .filter_entry(|e| e.file_type().is_dir() && (filter.filter_dir)(e.path()))
                     .filter_map(|e| e.ok())
                 {
-                    if e.file_type().is_dir() {
-                        self.paths.insert(e.path().to_path_buf());
-                        watcher.add_non_recursive_watch(e.path(), false);
-                    }
-                    if emit_for_contents {
-                        watcher.send(new_create(e.into_path()));
-                    }
+                    watcher.add_non_recursive_watch(e.path(), false);
+                    self.paths.insert(e.path().to_path_buf());
                 }
             }
             RecursiveMode::Recursive => {
                 if !self.is_native_recursive {
                     // simulate it
-                    self.paths.insert(dir.to_path_buf());
                     watcher.add_non_recursive_watch(dir, is_root);
+                    self.paths.insert(dir.to_path_buf());
                     for e in WalkDir::new(dir)
                         .min_depth(1)
                         .into_iter()
+                        .filter_entry(|e| e.file_type().is_dir())
                         .filter_map(|e| e.ok())
                     {
-                        if e.file_type().is_dir() {
-                            self.paths.insert(e.path().to_path_buf());
-                            watcher.add_non_recursive_watch(e.path(), false);
-                        }
-                        if emit_for_contents {
-                            watcher.send(new_create(e.into_path()));
-                        }
+                        watcher.add_non_recursive_watch(e.path(), false);
+                        self.paths.insert(e.path().to_path_buf());
                     }
                 }
             }
@@ -151,7 +121,7 @@ impl RootWatch {
     }
 }
 
-pub struct RecursionAdapter {
+pub(crate) struct RecursionAdapter {
     roots: HashMap<PathBuf, RootWatch>,
 }
 
@@ -162,8 +132,8 @@ impl RecursionAdapter {
         }
     }
 
-    pub fn handle_event(&mut self, ev: RawEvent, watcher: &mut impl WatcherInternal) {
-        if let Some((action, dir)) = event_action(&ev) {
+    pub fn handle_event(&mut self, ev: &RawEvent, watcher: &mut impl WatcherInternal) {
+        if let Some((action, dir)) = event_action(ev) {
             // special case for root
             if self.roots.contains_key(dir) {
                 // if it's a `Action::RenameFrom` we still want to watch it
@@ -178,7 +148,7 @@ impl RecursionAdapter {
                 if let Some(root_watch) = self.find_root(dir) {
                     match action {
                         Action::Add => {
-                            root_watch.add_watch(dir, watcher, false, false); // TODO change emit_for_contents to true
+                            root_watch.add_watch(dir, watcher, false);
                         }
                         Action::Remove | Action::RenameFrom => {
                             // If it's `Action::RenameFrom` remove watch
@@ -190,8 +160,6 @@ impl RecursionAdapter {
                 }
             }
         }
-
-        watcher.send(ev);
     }
 
     pub fn add_root(
@@ -224,7 +192,7 @@ impl RecursionAdapter {
             root_watch.paths.insert(path.clone());
             root_watch.is_native_recursive = true;
         } else {
-            root_watch.add_watch(&path, watcher, true, false);
+            root_watch.add_watch(&path, watcher, true);
         }
 
         self.roots.insert(path, root_watch);

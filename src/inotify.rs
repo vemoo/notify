@@ -55,9 +55,6 @@ impl WatcherInternal for EventLoop {
     fn remove_non_recursive_watch(&mut self, dir: &Path) {
         let _ = self.remove_watch(dir.to_path_buf(), false);
     }
-    fn send(&mut self, event: RawEvent) {
-        self.event_tx.send(event)
-    }
 }
 
 /// Watcher implementation based on inotify
@@ -272,8 +269,7 @@ impl EventLoopWrapper {
                         if let Some(ev) =
                             check_pending_rename_event(&mut self.event_loop.rename_event)
                         {
-                            self.recursion_adapter
-                                .handle_event(ev, &mut self.event_loop);
+                            self.send_event(ev);
                         }
                     }
                 }
@@ -399,9 +395,14 @@ impl EventLoopWrapper {
         }
 
         for ev in acc_events {
-            self.recursion_adapter
-                .handle_event(ev, &mut self.event_loop);
+            self.send_event(ev);
         }
+    }
+
+    fn send_event(&mut self, event: RawEvent) {
+        self.recursion_adapter
+            .handle_event(&event, &mut self.event_loop);
+        self.event_loop.event_tx.send(event);
     }
 }
 

@@ -1384,29 +1384,43 @@ fn filtered_watch() {
         "dir1/subdir2",
         "dir1/subdir2/subdir1",
         "dir1/subdir2/subdir1/file1",
+        "dir1/subdir2/subdir1/ignored_file",
         "dir1/subdir2/ignored_dir",
         "dir1/subdir2/ignored_dir/file1",
     ];
 
     let (tx, rx) = mpsc::channel();
-    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_millis(DELAY_MS))
-        .expect("failed to create debounced watcher");
+    let mut watcher: RecommendedWatcher =
+        Watcher::new_raw(tx).expect("failed to create debounced watcher");
 
     let filter = RecursionFilter {
         follow_links: false,
-        filter: Box::new(|d| d.path.file_name().and_then(|n| n.to_str()) != Some("ignored_dir")),
+        filter: Box::new(|d| {
+            d.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(true, |x| !x.starts_with("ignored_"))
+        }),
     };
     watcher
         .watch(tdir.mkpath("."), RecursiveMode::Filtered(filter))
         .expect("failed to watch directory");
 
+    let thread = std::thread::spawn(|| {
+        for ev in rx.into_iter() {
+            println!("{:?}", ev);
+        }
+    });
+
     for f in &files {
         tdir.create(f);
-        println!("{}", f);
         sleep(10);
     }
 
-    for ev in rx.into_iter() {
-        println!("{:?}", ev);
-    }
+    tdir.rename("dir1/ignored_dir", "dir1/non_ignored_dir");
+    sleep(10);
+    tdir.rename("dir1/subdir2", "dir1/ignored_subdir1");
+    sleep(10);
+
+    thread.join().unwrap();
 }

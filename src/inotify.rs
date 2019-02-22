@@ -38,7 +38,6 @@ struct EventLoop {
     event_loop_tx: mio_extras::channel::Sender<EventLoopMsg>,
     event_loop_rx: mio_extras::channel::Receiver<EventLoopMsg>,
     inotify: Option<Inotify>,
-    event_tx: EventTx,
     watches: HashMap<PathBuf, (WatchDescriptor, WatchMask, bool)>,
     paths: HashMap<WatchDescriptor, PathBuf>,
     rename_event: Option<RawEvent>,
@@ -77,7 +76,7 @@ fn check_pending_rename_event(rename_event: &mut Option<RawEvent>) -> Option<Raw
 }
 
 impl EventLoop {
-    pub fn new(inotify: Inotify, event_tx: EventTx) -> Result<EventLoop> {
+    pub fn new(inotify: Inotify) -> Result<EventLoop> {
         let (event_loop_tx, event_loop_rx) = mio_extras::channel::channel::<EventLoopMsg>();
         let poll = mio::Poll::new()?;
         poll.register(
@@ -102,7 +101,6 @@ impl EventLoop {
             event_loop_tx,
             event_loop_rx,
             inotify: Some(inotify),
-            event_tx,
             watches: HashMap::new(),
             paths: HashMap::new(),
             rename_event: None,
@@ -185,22 +183,17 @@ impl EventLoop {
 struct EventLoopWrapper {
     event_loop: EventLoop,
     recursion_adapter: RecursionAdapter,
+    event_tx: EventTx,
     events_buffer: Vec<RawEvent>,
-}
-
-fn send_event(recursion_adapter: &mut RecursionAdapter, event_loop: &mut EventLoop, ev: RawEvent) {
-    if let Err(_e) = recursion_adapter.handle_event(&ev, event_loop) {
-        // TODO log error?
-    }
-    event_loop.event_tx.send(ev);
 }
 
 impl EventLoopWrapper {
     pub fn new(inotify: Inotify, event_tx: EventTx) -> Result<EventLoopWrapper> {
-        let event_loop = EventLoop::new(inotify, event_tx)?;
+        let event_loop = EventLoop::new(inotify)?;
         Ok(EventLoopWrapper {
             event_loop,
             recursion_adapter: RecursionAdapter::new(),
+            event_tx,
             events_buffer: Vec::new(),
         })
     }
@@ -280,7 +273,11 @@ impl EventLoopWrapper {
                         if let Some(ev) =
                             check_pending_rename_event(&mut self.event_loop.rename_event)
                         {
-                            send_event(&mut self.recursion_adapter, &mut self.event_loop, ev);
+                            self.recursion_adapter.handle_event(
+                                ev,
+                                &mut self.event_loop,
+                                &mut self.event_tx,
+                            );
                         }
                     }
                 }
@@ -404,7 +401,8 @@ impl EventLoopWrapper {
         }
 
         for ev in self.events_buffer.drain(..) {
-            send_event(&mut self.recursion_adapter, &mut self.event_loop, ev);
+            self.recursion_adapter
+                .handle_event(ev, &mut self.event_loop, &mut self.event_tx);
         }
     }
 }

@@ -773,25 +773,14 @@ fn create_directory_watch_subdirectories() {
 
     tdir.create("dir1/dir2/file1");
 
-    if cfg!(target_os = "linux") {
-        assert_eq!(
-            recv_events_debounced(&rx),
-            vec![
-                DebouncedEvent::Create(tdir.mkpath("dir1")),
-                DebouncedEvent::Create(tdir.mkpath("dir1/dir2/file1")),
-            ]
-        );
-    } else {
-        /*  */
-        assert_eq!(
-            recv_events_debounced(&rx),
-            vec![
-                DebouncedEvent::Create(tdir.mkpath("dir1")),
-                DebouncedEvent::Create(tdir.mkpath("dir1/dir2")),
-                DebouncedEvent::Create(tdir.mkpath("dir1/dir2/file1")),
-            ]
-        );
-    }
+    assert_eq!(
+        recv_events_debounced(&rx),
+        vec![
+            DebouncedEvent::Create(tdir.mkpath("dir1")),
+            DebouncedEvent::Create(tdir.mkpath("dir1/dir2")),
+            DebouncedEvent::Create(tdir.mkpath("dir1/dir2/file1")),
+        ]
+    );
 }
 
 #[test]
@@ -1229,13 +1218,24 @@ fn move_in_directory_watch_subdirectories() {
 
     tdir.create("watch_dir/dir1/dir2/file1");
 
-    assert_eq!(
-        recv_events_debounced(&rx),
-        vec![
-            DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1")),
-            DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1/dir2/file1")),
-        ]
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            recv_events_debounced(&rx),
+            vec![
+                DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1")),
+                DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1/dir2")),
+                DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1/dir2/file1")),
+            ]
+        );
+    } else {
+        assert_eq!(
+            recv_events_debounced(&rx),
+            vec![
+                DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1")),
+                DebouncedEvent::Create(tdir.mkpath("watch_dir/dir1/dir2/file1")),
+            ]
+        );
+    }
 }
 
 // https://github.com/passcod/notify/issues/129
@@ -1365,4 +1365,48 @@ fn one_file_many_events() {
         cutoff
     );
     io_thread.join().unwrap();
+}
+
+// #[test]
+fn filtered_watch() {
+    let tdir = TempDir::new("temp_dir").expect("failed to create temporary directory");
+
+    let files = vec![
+        "dir1",
+        "dir1/file1",
+        "dir1/ignored_dir",
+        "dir1/ignored_dir/file1",
+        "dir1/ignored_dir/subdir1",
+        "dir1/ignored_dir/subdir1/file1",
+        "dir1/subdir1",
+        "dir1/subdir1/file1",
+        "dir1/subdir1/file2",
+        "dir1/subdir2",
+        "dir1/subdir2/subdir1",
+        "dir1/subdir2/subdir1/file1",
+        "dir1/subdir2/ignored_dir",
+        "dir1/subdir2/ignored_dir/file1",
+    ];
+
+    let (tx, rx) = mpsc::channel();
+    let mut watcher: RecommendedWatcher = Watcher::new(tx, Duration::from_millis(DELAY_MS))
+        .expect("failed to create debounced watcher");
+
+    let filter = RecursionFilter {
+        follow_links: false,
+        filter: Box::new(|d| d.path.file_name().and_then(|n| n.to_str()) != Some("ignored_dir")),
+    };
+    watcher
+        .watch(tdir.mkpath("."), RecursiveMode::Filtered(filter))
+        .expect("failed to watch directory");
+
+    for f in &files {
+        tdir.create(f);
+        println!("{}", f);
+        sleep(10);
+    }
+
+    for ev in rx.into_iter() {
+        println!("{:?}", ev);
+    }
 }

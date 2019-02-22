@@ -2,44 +2,81 @@ extern crate walkdir;
 
 use self::walkdir::WalkDir;
 
-use crate::{op, Error, RawEvent, RecursiveMode, Result};
+use crate::{debounce::EventTx, op, Error, FilterItem, RawEvent, RecursiveMode, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::iter::Iterator;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+struct EventInfo {
+    path: PathBuf,
+    file_type: Option<fs::FileType>,
+    action: Action,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 enum Action {
     Add,
     Remove,
     RenameFrom,
+    RenameTo,
+    Other,
 }
 
-fn event_action(ev: &RawEvent) -> Option<(Action, &Path)> {
-    let path = ev.path.as_ref()?;
-    let op = ev.op.as_ref().ok()?;
+fn event_info(ev: &RawEvent, file_type: Option<io::Result<fs::FileType>>) -> Option<EventInfo> {
+    let path = ev.path.clone()?;
+    let op = match ev.op.as_ref() {
+        Ok(op) => op,
+        Err(_) => {
+            let file_type = file_type
+                .unwrap_or_else(|| fs::metadata(&path).map(|x| x.file_type()))
+                .ok();
+            return Some(EventInfo {
+                path,
+                action: Action::Other,
+                file_type,
+            });
+        }
+    };
     if op.contains(op::REMOVE) {
-        Some((Action::Remove, path))
+        Some(EventInfo {
+            path,
+            action: Action::Remove,
+            file_type: None,
+        })
     } else {
-        let is_dir = fs::metadata(path).ok().map(|m| m.is_dir());
+        let file_type = file_type
+            .unwrap_or_else(|| fs::metadata(&path).map(|x| x.file_type()))
+            .ok();
         if op.contains(op::CREATE) {
-            if is_dir == Some(true) {
-                Some((Action::Add, path))
-            } else {
-                None
-            }
+            Some(EventInfo {
+                path,
+                action: Action::Add,
+                file_type,
+            })
         } else if op.contains(op::RENAME) {
-            if is_dir.is_none() {
-                Some((Action::RenameFrom, path))
-            } else if is_dir == Some(true) {
-                Some((Action::Add, path))
+            let action = if file_type.is_some() {
+                Action::RenameTo
             } else {
-                // if it's a file we shouldn't do anything for renames
-                None
-            }
+                Action::RenameFrom
+            };
+            Some(EventInfo {
+                path,
+                action,
+                file_type,
+            })
         } else {
             None
         }
+    }
+}
+
+fn new_create_event(path: impl Into<PathBuf>) -> RawEvent {
+    RawEvent {
+        path: Some(path.into()),
+        op: Ok(op::CREATE),
+        cookie: None,
     }
 }
 
@@ -62,8 +99,9 @@ impl RootWatch {
     fn add_watch(
         &mut self,
         dir: &Path,
-        watcher: &mut impl WatcherInternal,
         is_root: bool,
+        watcher: &mut impl WatcherInternal,
+        mut event_tx: Option<&mut EventTx>,
     ) -> Result<()> {
         match &self.mode {
             RecursiveMode::Filtered(filter) => {
@@ -73,11 +111,14 @@ impl RootWatch {
                     .min_depth(1)
                     .follow_links(filter.follow_links)
                     .into_iter()
-                    .filter_entry(|e| e.file_type().is_dir() && (filter.filter_dir)(e.path()))
+                    .filter_entry(|e| (filter.filter)(e.into()))
                     .filter_map(|e| e.ok())
                 {
                     watcher.add_non_recursive_watch(e.path(), false)?;
                     self.paths.insert(e.path().to_path_buf());
+                    if let Some(event_tx) = event_tx.as_mut() {
+                        event_tx.send(new_create_event(e.path()))
+                    }
                 }
             }
             RecursiveMode::Recursive => {
@@ -93,6 +134,9 @@ impl RootWatch {
                     {
                         watcher.add_non_recursive_watch(e.path(), false)?;
                         self.paths.insert(e.path().to_path_buf());
+                        if let Some(event_tx) = event_tx.as_mut() {
+                            event_tx.send(new_create_event(e.path()))
+                        }
                     }
                 }
             }
@@ -141,38 +185,93 @@ impl RecursionAdapter {
 
     pub fn handle_event(
         &mut self,
-        ev: &RawEvent,
+        ev: RawEvent,
         watcher: &mut impl WatcherInternal,
-    ) -> Result<()> {
-        if let Some((action, dir)) = event_action(ev) {
-            // special case for root
-            if self.roots.contains_key(dir) {
-                // if it's a `Action::RenameFrom` we still want to watch it
-                // and `Action::Create` shouldn't happen
-                if action == Action::Remove {
-                    // ok to unwrap because of `contains_key` check
-                    let root_watch = self.roots.remove(dir).unwrap();
-                    root_watch.remove_all(watcher)?;
+        event_tx: &mut EventTx,
+    ) {
+        self.handle_event_inner(ev, None, watcher, event_tx)
+    }
+
+    pub fn handle_event_with_file_type(
+        &mut self,
+        ev: RawEvent,
+        file_type: io::Result<fs::FileType>,
+        watcher: &mut impl WatcherInternal,
+        event_tx: &mut EventTx,
+    ) {
+        self.handle_event_inner(ev, Some(file_type), watcher, event_tx)
+    }
+
+    fn handle_event_inner(
+        &mut self,
+        ev: RawEvent,
+        file_type: Option<io::Result<fs::FileType>>,
+        watcher: &mut impl WatcherInternal,
+        event_tx: &mut EventTx,
+    ) {
+        let info = match event_info(&ev, file_type) {
+            Some(info) => info,
+            None => {
+                event_tx.send(ev);
+                return;
+            }
+        };
+        // special case for root
+        if self.roots.contains_key(&info.path) {
+            event_tx.send(ev);
+            // if it's a rename we still want to watch it
+            if info.action == Action::Remove {
+                // ok to unwrap because of `contains_key` check
+                let root_watch = self.roots.remove(&info.path).unwrap();
+                if let Err(_e) = root_watch.remove_all(watcher) {
+                    // TODO log error?
                 }
-            } else {
-                // find containing root
-                if let Some(root_watch) = self.find_root(dir) {
-                    match action {
-                        Action::Add => {
-                            root_watch.add_watch(dir, watcher, false)?;
-                        }
-                        Action::Remove | Action::RenameFrom => {
-                            // If it's `Action::RenameFrom` remove watch
-                            // because it could have moved outside the root or not match the filter anymore
-                            // If we should still be watching it we will receive another event with `Action::Add`
-                            root_watch.remove_watch(dir, watcher)?;
+            }
+        } else {
+            // find containing root
+            if let Some(root_watch) = self.find_root(&info.path) {
+                // check if we should ignore the event itself
+                if let RecursiveMode::Filtered(filter) = &root_watch.mode {
+                    if !(filter.filter)(FilterItem {
+                        path: &info.path,
+                        file_type: info.file_type,
+                    }) {
+                        return;
+                    }
+                }
+                // send before, since `add_watch` could also send events for nested paths
+                event_tx.send(ev);
+                let is_dir = info.file_type.map_or(false, |f| f.is_dir());
+                match info.action {
+                    Action::Add if is_dir => {
+                        // it it's an add we can be sure that we haven't emited events
+                        // for the contents, so pass the event_tx
+                        if let Err(_e) =
+                            root_watch.add_watch(&info.path, false, watcher, Some(event_tx))
+                        {
+                            // TODO log error?
                         }
                     }
+                    Action::RenameTo if is_dir => {
+                        // if it's a rename, we cannot know if we have already emited events
+                        // for the contents, do not pass the event_tx
+                        if let Err(_e) = root_watch.add_watch(&info.path, false, watcher, None) {
+                            // TODO log error?
+                        }
+                    }
+                    Action::Remove | Action::RenameFrom => {
+                        // If it's `Action::RenameFrom` remove watch
+                        // because it could have moved outside the root or not match the filter anymore
+                        // If we should still be watching it we will receive another event with `Action::Add`
+                        // or `Action::RenameTo`
+                        if let Err(_e) = root_watch.remove_watch(&info.path, watcher) {
+                            // TODO log error?
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
-
-        Ok(())
     }
 
     pub fn add_root(
@@ -180,6 +279,16 @@ impl RecursionAdapter {
         path: PathBuf,
         mode: RecursiveMode,
         watcher: &mut impl WatcherInternal,
+    ) -> Result<()> {
+        self.add_root_inner(path, mode, watcher, None)
+    }
+
+    fn add_root_inner(
+        &mut self,
+        path: PathBuf,
+        mode: RecursiveMode,
+        watcher: &mut impl WatcherInternal,
+        event_tx: Option<&mut EventTx>,
     ) -> Result<()> {
         // TODO what if `path` already exists with a different `RecursiveMode`
         if self.roots.contains_key(&path) {
@@ -205,7 +314,7 @@ impl RecursionAdapter {
             root_watch.paths.insert(path.clone());
             root_watch.is_native_recursive = true;
         } else {
-            root_watch.add_watch(&path, watcher, true)?;
+            root_watch.add_watch(&path, true, watcher, event_tx)?;
         }
 
         self.roots.insert(path, root_watch);

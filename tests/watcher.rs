@@ -499,6 +499,7 @@ fn watch_recursive_move_in() {
             actual,
             vec![
                 (tdir.mkpath("watch_dir/dir1b"), op::Op::CREATE, None),
+                (tdir.mkpath("watch_dir/dir1b/dir1"), op::Op::CREATE, None),
                 (
                     tdir.mkpath("watch_dir/dir1b/dir1/file1"),
                     op::Op::CREATE,

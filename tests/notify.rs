@@ -508,6 +508,7 @@ fn create_directory_watch_subdirectories() {
             actual,
             vec![
                 (tdir.mkpath("dir1"), op::Op::CREATE, None),
+                (tdir.mkpath("dir1/dir2"), op::Op::CREATE, None),
                 (tdir.mkpath("dir1/dir2/file1"), op::Op::CREATE, None),
                 (tdir.mkpath("dir1/dir2/file1"), op::Op::CLOSE_WRITE, None),
             ]
@@ -742,6 +743,7 @@ fn move_in_directory_watch_subdirectories() {
             recv_events(&rx),
             vec![
                 (tdir.mkpath("watch_dir/dir1"), op::Op::CREATE, None),
+                (tdir.mkpath("watch_dir/dir1/dir2"), op::Op::CREATE, None),
                 (
                     tdir.mkpath("watch_dir/dir1/dir2/file1"),
                     op::Op::CREATE,

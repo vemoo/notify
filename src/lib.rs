@@ -119,6 +119,7 @@ pub use self::fsevent::FsEventWatcher;
 pub use self::inotify::INotifyWatcher;
 pub use self::null::NullWatcher;
 pub use self::poll::PollWatcher;
+pub use self::recursion::{FilterItem, RecursionFilter};
 #[cfg(target_os = "windows")]
 pub use self::windows::ReadDirectoryChangesWatcher;
 
@@ -523,31 +524,6 @@ impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {
         Error::Io(err)
     }
-}
-
-/// The type used to filter events
-pub struct FilterItem<'a> {
-    /// Path of file system enbtry the event refers to
-    pub path: &'a Path,
-    /// File type if it's available (won't be available on deletes and from part of renames)
-    pub file_type: Option<std::fs::FileType>,
-}
-
-impl<'a> From<&'a walkdir::DirEntry> for FilterItem<'a> {
-    fn from(dir_entry: &'a walkdir::DirEntry) -> FilterItem<'a> {
-        FilterItem {
-            path: dir_entry.path(),
-            file_type: Some(dir_entry.file_type()),
-        }
-    }
-}
-
-/// Options for filtered recursion mode
-pub struct RecursionFilter {
-    /// Watch only directories that match this predicate
-    pub filter: Box<Fn(FilterItem) -> bool + Send>,
-    /// Whether the watcher should also desdend into links
-    pub follow_links: bool,
 }
 
 /// Indicates whether only the provided directory or its sub-directories as well should be watched

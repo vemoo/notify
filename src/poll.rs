@@ -23,7 +23,7 @@ struct PathData {
 }
 
 struct WatchData {
-    is_recursive: bool,
+    recursive_mode: RecursiveMode,
     paths: HashMap<PathBuf, PathData>,
 }
 
@@ -32,6 +32,38 @@ pub struct PollWatcher {
     event_tx: EventTx,
     watches: Arc<Mutex<HashMap<PathBuf, WatchData>>>,
     open: Arc<RwLock<bool>>,
+}
+
+fn walkdir<'a>(
+    dir: &Path,
+    recursive_mode: &'a RecursiveMode,
+) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
+    let max_depth;
+    let follow_links;
+    match recursive_mode {
+        RecursiveMode::Filtered(filter) => {
+            max_depth = usize::max_value();
+            follow_links = filter.follow_links;
+        }
+        RecursiveMode::Recursive => {
+            max_depth = usize::max_value();
+            follow_links = true;
+        }
+        RecursiveMode::NonRecursive => {
+            max_depth = 1;
+            follow_links = true;
+        }
+    }
+
+    WalkDir::new(dir)
+        .follow_links(follow_links)
+        .max_depth(max_depth)
+        .into_iter()
+        .filter_entry(move |e| match recursive_mode {
+            RecursiveMode::Filtered(filter) => (filter.filter)(e.into()),
+            RecursiveMode::Recursive | RecursiveMode::NonRecursive => true,
+        })
+        .filter_map(|e| e.ok())
 }
 
 impl PollWatcher {
@@ -68,7 +100,7 @@ impl PollWatcher {
                     for (
                         watch,
                         &mut WatchData {
-                            is_recursive,
+                            ref recursive_mode,
                             ref mut paths,
                         },
                     ) in watches.iter_mut()
@@ -109,13 +141,7 @@ impl PollWatcher {
                                         }
                                     }
                                 } else {
-                                    let depth = if is_recursive { usize::max_value() } else { 1 };
-                                    for entry in WalkDir::new(watch)
-                                        .follow_links(true)
-                                        .max_depth(depth)
-                                        .into_iter()
-                                        .filter_map(|e| e.ok())
-                                    {
+                                    for entry in walkdir(watch, recursive_mode) {
                                         let path = entry.path();
 
                                         match entry.metadata() {
@@ -235,23 +261,13 @@ impl Watcher for PollWatcher {
                         watches.insert(
                             watch,
                             WatchData {
-                                is_recursive: recursive_mode.is_recursive(),
+                                recursive_mode,
                                 paths: paths,
                             },
                         );
                     } else {
                         let mut paths = HashMap::new();
-                        let depth = if recursive_mode.is_recursive() {
-                            usize::max_value()
-                        } else {
-                            1
-                        };
-                        for entry in WalkDir::new(watch.clone())
-                            .follow_links(true)
-                            .max_depth(depth)
-                            .into_iter()
-                            .filter_map(|e| e.ok())
-                        {
+                        for entry in walkdir(&watch, &recursive_mode) {
                             let path = entry.path();
 
                             match entry.metadata() {
@@ -277,7 +293,7 @@ impl Watcher for PollWatcher {
                         watches.insert(
                             watch,
                             WatchData {
-                                is_recursive: recursive_mode.is_recursive(),
+                                recursive_mode,
                                 paths: paths,
                             },
                         );

@@ -322,6 +322,10 @@ unsafe extern "system" fn handle_event(
         return;
     }
 
+    handle_event_inner(request);
+}
+
+fn handle_event_inner(request: Box<ReadDirectoryRequest>) {
     // Get the next request queued up as soon as possible
     start_read(&request.data, request.event_tx.clone(), request.handle);
 
@@ -333,11 +337,12 @@ unsafe extern "system" fn handle_event(
         // string as its last member.  Each struct contains an offset for getting the next entry in
         // the buffer.
         let mut cur_offset: *const u8 = request.buffer.as_ptr();
-        let mut cur_entry: *const FILE_NOTIFY_INFORMATION = mem::transmute(cur_offset);
+        let mut cur_entry: &mut FILE_NOTIFY_INFORMATION = unsafe { mem::transmute(cur_offset) };
         loop {
             // filename length is size in bytes, so / 2
-            let len = (*cur_entry).FileNameLength as usize / 2;
-            let encoded_path: &[u16] = slice::from_raw_parts((*cur_entry).FileName.as_ptr(), len);
+            let len = cur_entry.FileNameLength as usize / 2;
+            let encoded_path: &[u16] =
+                unsafe { slice::from_raw_parts((*cur_entry).FileName.as_ptr(), len) };
             // prepend root to get a full path
             let path = request
                 .data
@@ -352,7 +357,7 @@ unsafe extern "system" fn handle_event(
             };
 
             if !skip {
-                if (*cur_entry).Action == winnt::FILE_ACTION_RENAMED_OLD_NAME {
+                if cur_entry.Action == winnt::FILE_ACTION_RENAMED_OLD_NAME {
                     send_pending_rename_event(rename_event, &mut event_tx);
                     if request.data.file.is_some() {
                         event_tx.send(RawEvent {
@@ -362,18 +367,20 @@ unsafe extern "system" fn handle_event(
                         });
                         rename_event = None;
                     } else {
-                        COOKIE_COUNTER = COOKIE_COUNTER.wrapping_add(1);
-                        rename_event = Some(RawEvent {
-                            path: Some(path),
-                            op: Ok(op::Op::RENAME),
-                            cookie: Some(COOKIE_COUNTER),
-                        });
+                        unsafe {
+                            COOKIE_COUNTER = COOKIE_COUNTER.wrapping_add(1);
+                            rename_event = Some(RawEvent {
+                                path: Some(path),
+                                op: Ok(op::Op::RENAME),
+                                cookie: Some(COOKIE_COUNTER),
+                            });
+                        }
                     }
                 } else {
                     let mut o = Op::empty();
                     let mut c = None;
 
-                    match (*cur_entry).Action {
+                    match cur_entry.Action {
                         winnt::FILE_ACTION_RENAMED_NEW_NAME => {
                             if let Some(e) = rename_event {
                                 if let Some(cookie) = e.cookie {
@@ -405,11 +412,11 @@ unsafe extern "system" fn handle_event(
                 }
             }
 
-            if (*cur_entry).NextEntryOffset == 0 {
+            if cur_entry.NextEntryOffset == 0 {
                 break;
             }
-            cur_offset = cur_offset.offset((*cur_entry).NextEntryOffset as isize);
-            cur_entry = mem::transmute(cur_offset);
+            cur_offset = unsafe { cur_offset.offset(cur_entry.NextEntryOffset as isize) };
+            cur_entry = unsafe { mem::transmute(cur_offset) };
         }
 
         send_pending_rename_event(rename_event, &mut event_tx);

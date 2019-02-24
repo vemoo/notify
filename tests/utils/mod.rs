@@ -47,6 +47,25 @@ pub fn recv_events(rx: &Receiver<RawEvent>) -> Vec<(PathBuf, Op, Option<u32>)> {
     recv_events_with_timeout(rx, Duration::from_millis(TIMEOUT_MS))
 }
 
+pub fn recv_events_debounced(
+    rx: &Receiver<DebouncedEvent>,
+    timeout: Duration,
+) -> Vec<DebouncedEvent> {
+    let start = Instant::now();
+
+    let mut events = Vec::new();
+
+    while start.elapsed() < timeout {
+        match rx.try_recv() {
+            Ok(event) => events.push(event),
+            Err(TryRecvError::Empty) => (),
+            Err(e) => panic!("unexpected channel err: {:?}", e),
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    events
+}
+
 // FSEvents tends to emit events multiple times and aggregate events,
 // so just check that all expected events arrive for each path,
 // and make sure the paths are in the correct order

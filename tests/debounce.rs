@@ -17,19 +17,7 @@ const DELAY_MS: u64 = 1000;
 const TIMEOUT_MS: u64 = 1000;
 
 fn recv_events_debounced(rx: &mpsc::Receiver<DebouncedEvent>) -> Vec<DebouncedEvent> {
-    let start = Instant::now();
-
-    let mut events = Vec::new();
-
-    while start.elapsed() < Duration::from_millis(DELAY_MS + TIMEOUT_MS) {
-        match rx.try_recv() {
-            Ok(event) => events.push(event),
-            Err(mpsc::TryRecvError::Empty) => (),
-            Err(e) => panic!("unexpected channel err: {:?}", e),
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    events
+    utils::recv_events_debounced(rx, Duration::from_millis(DELAY_MS + TIMEOUT_MS))
 }
 
 #[test]

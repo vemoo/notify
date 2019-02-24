@@ -16,6 +16,7 @@ use winapi::um::winbase::{self, INFINITE, WAIT_OBJECT_0};
 use winapi::um::winnt::{self, FILE_NOTIFY_INFORMATION, HANDLE};
 
 use super::debounce::{Debounce, EventTx};
+use super::recursion::{RecursionAdapter, WatcherInternal};
 use super::{op, DebouncedEvent, Error, Op, RawEvent, RecursiveMode, Result, Watcher};
 use std::collections::HashMap;
 use std::env;
@@ -44,7 +45,7 @@ struct ReadData {
 }
 
 struct ReadDirectoryRequest {
-    event_tx: Arc<Mutex<EventTx>>,
+    server_inner: Arc<Mutex<ServerInner>>,
     buffer: [u8; BUF_SIZE as usize],
     handle: HANDLE,
     data: ReadData,
@@ -66,82 +67,23 @@ struct WatchState {
     complete_sem: HANDLE,
 }
 
-struct ReadDirectoryChangesServer {
-    rx: Receiver<Action>,
-    event_tx: Arc<Mutex<EventTx>>,
-    meta_tx: Sender<MetaEvent>,
-    cmd_tx: Sender<Result<PathBuf>>,
+// TODO better name
+struct State {
     watches: HashMap<PathBuf, WatchState>,
-    wakeup_sem: HANDLE,
+    pending_start_reads: Vec<(ReadData, HANDLE)>,
+    meta_tx: Sender<MetaEvent>,
 }
 
-impl ReadDirectoryChangesServer {
-    fn start(
-        event_tx: EventTx,
-        meta_tx: Sender<MetaEvent>,
-        cmd_tx: Sender<Result<PathBuf>>,
-        wakeup_sem: HANDLE,
-    ) -> Sender<Action> {
-        let (action_tx, action_rx) = channel();
-        // it is, in fact, ok to send the semaphore across threads
-        let sem_temp = wakeup_sem as u64;
-        thread::spawn(move || {
-            let wakeup_sem = sem_temp as HANDLE;
-            let server = ReadDirectoryChangesServer {
-                rx: action_rx,
-                event_tx: Arc::new(Mutex::new(event_tx)),
-                meta_tx: meta_tx,
-                cmd_tx: cmd_tx,
-                watches: HashMap::new(),
-                wakeup_sem: wakeup_sem,
-            };
-            server.run();
-        });
-        action_tx
-    }
-
-    fn run(mut self) {
-        loop {
-            // process all available actions first
-            let mut stopped = false;
-
-            while let Ok(action) = self.rx.try_recv() {
-                match action {
-                    Action::Watch(path, recursive_mode) => {
-                        let res = self.add_watch(path, recursive_mode.is_recursive());
-                        let _ = self.cmd_tx.send(res);
-                    }
-                    Action::Unwatch(path) => self.remove_watch(path),
-                    Action::Stop => {
-                        stopped = true;
-                        for (_, ws) in &self.watches {
-                            stop_watch(ws, &self.meta_tx);
-                        }
-                        break;
-                    }
-                }
-            }
-
-            if stopped {
-                break;
-            }
-
-            unsafe {
-                // wait with alertable flag so that the completion routine fires
-                let waitres = kernel32::WaitForSingleObjectEx(self.wakeup_sem, 100, TRUE);
-                if waitres == WAIT_OBJECT_0 {
-                    let _ = self.meta_tx.send(MetaEvent::WatcherAwakened);
-                }
-            }
-        }
-
-        // we have to clean this up, since the watcher may be long gone
-        unsafe {
-            kernel32::CloseHandle(self.wakeup_sem);
+impl State {
+    fn new(meta_tx: Sender<MetaEvent>) -> State {
+        State {
+            watches: HashMap::new(),
+            pending_start_reads: Vec::new(),
+            meta_tx,
         }
     }
 
-    fn add_watch(&mut self, path: PathBuf, is_recursive: bool) -> Result<PathBuf> {
+    fn add_watch(&mut self, path: PathBuf, is_recursive: bool) -> Result<()> {
         // path must exist and be either a file or directory
         if !path.is_dir() && !path.is_file() {
             return Err(Error::Generic(
@@ -211,18 +153,166 @@ impl ReadDirectoryChangesServer {
             complete_sem: semaphore,
             is_recursive: is_recursive,
         };
+        self.pending_start_reads.push((rd, handle));
         let ws = WatchState {
             dir_handle: handle,
             complete_sem: semaphore,
         };
-        self.watches.insert(path.clone(), ws);
-        start_read(&rd, self.event_tx.clone(), handle);
-        Ok(path.to_path_buf())
+
+        self.watches.insert(path, ws);
+
+        Ok(())
     }
 
-    fn remove_watch(&mut self, path: PathBuf) {
-        if let Some(ws) = self.watches.remove(&path) {
+    fn remove_watch(&mut self, path: &Path) {
+        if let Some(ws) = self.watches.remove(path) {
             stop_watch(&ws, &self.meta_tx);
+        }
+    }
+}
+
+impl WatcherInternal for State {
+    fn add_recursive_watch(&mut self, dir: &Path) -> Result<bool> {
+        self.add_watch(dir.to_path_buf(), true).map(|_| true)
+    }
+
+    fn add_non_recursive_watch(&mut self, dir: &Path, _is_root: bool) -> Result<()> {
+        self.add_watch(dir.to_path_buf(), false)
+    }
+
+    fn remove_non_recursive_watch(&mut self, dir: &Path) -> Result<()> {
+        self.remove_watch(dir);
+        Ok(())
+    }
+}
+
+fn process_pending_start_reads(server_inner: &Arc<Mutex<ServerInner>>) {
+    let pending_start_reads = match server_inner.lock() {
+        Ok(mut server_inner) => {
+            std::mem::replace(&mut server_inner.state.pending_start_reads, Vec::new())
+        }
+        Err(_) => {
+            return;
+        }
+    };
+
+    for (rd, handle) in pending_start_reads {
+        start_read(&rd, server_inner.clone(), handle);
+    }
+}
+
+struct ServerInner {
+    state: State,
+    event_tx: EventTx,
+    recursion_adapter: RecursionAdapter,
+}
+
+fn send(server_inner: &Arc<Mutex<ServerInner>>, ev: RawEvent) {
+    if let Ok(mut server_inner) = server_inner.lock() {
+        let server_inner = &mut *server_inner;
+        server_inner.recursion_adapter.handle_event(
+            ev,
+            &mut server_inner.state,
+            &mut server_inner.event_tx,
+        );
+    }
+}
+
+struct Server {
+    inner: Arc<Mutex<ServerInner>>,
+    rx: Receiver<Action>,
+    cmd_tx: Sender<Result<PathBuf>>,
+    wakeup_sem: HANDLE,
+}
+
+impl Server {
+    fn start(
+        event_tx: EventTx,
+        meta_tx: Sender<MetaEvent>,
+        cmd_tx: Sender<Result<PathBuf>>,
+        wakeup_sem: HANDLE,
+    ) -> Sender<Action> {
+        let (action_tx, action_rx) = channel();
+        // it is, in fact, ok to send the semaphore across threads
+        let sem_temp = wakeup_sem as u64;
+        thread::spawn(move || {
+            let wakeup_sem = sem_temp as HANDLE;
+            let server = Server {
+                inner: Arc::new(Mutex::new({
+                    ServerInner {
+                        recursion_adapter: RecursionAdapter::new(),
+                        event_tx,
+                        state: State::new(meta_tx),
+                    }
+                })),
+                rx: action_rx,
+                cmd_tx,
+                wakeup_sem,
+            };
+
+            server.run();
+        });
+        action_tx
+    }
+
+    fn run(self) {
+        loop {
+            // process all available actions first
+            let mut stopped = false;
+
+            while let Ok(action) = self.rx.try_recv() {
+                match action {
+                    Action::Watch(path, recursive_mode) => {
+                        let res = match self.inner.lock() {
+                            Ok(mut inner) => {
+                                let inner = &mut *inner;
+                                let path_clone = path.clone();
+                                let res = inner
+                                    .recursion_adapter
+                                    .add_root(path, recursive_mode, &mut inner.state)
+                                    .map(|_| path_clone);
+                                res
+                            }
+                            Err(e) => Err(Error::Generic(format!("{}", e))),
+                        };
+                        process_pending_start_reads(&self.inner);
+                        let _ = self.cmd_tx.send(res);
+                    }
+                    Action::Unwatch(path) => {
+                        if let Ok(mut inner) = self.inner.lock() {
+                            let inner = &mut *inner;
+                            let _ = inner.recursion_adapter.remove_root(&path, &mut inner.state);
+                        }
+                    }
+                    Action::Stop => {
+                        stopped = true;
+                        if let Ok(mut inner) = self.inner.lock() {
+                            let inner = &mut *inner;
+                            let _ = inner.recursion_adapter.remove_all(&mut inner.state);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if stopped {
+                break;
+            }
+
+            unsafe {
+                // wait with alertable flag so that the completion routine fires
+                let waitres = kernel32::WaitForSingleObjectEx(self.wakeup_sem, 100, TRUE);
+                if waitres == WAIT_OBJECT_0 {
+                    if let Ok(inner) = self.inner.lock() {
+                        let _ = inner.state.meta_tx.send(MetaEvent::WatcherAwakened);
+                    }
+                }
+            }
+        }
+
+        // we have to clean this up, since the watcher may be long gone
+        unsafe {
+            kernel32::CloseHandle(self.wakeup_sem);
         }
     }
 }
@@ -240,9 +330,9 @@ fn stop_watch(ws: &WatchState, meta_tx: &Sender<MetaEvent>) {
     let _ = meta_tx.send(MetaEvent::SingleWatchComplete);
 }
 
-fn start_read(rd: &ReadData, event_tx: Arc<Mutex<EventTx>>, handle: HANDLE) {
+fn start_read(rd: &ReadData, server_inner: Arc<Mutex<ServerInner>>, handle: HANDLE) {
     let mut request = Box::new(ReadDirectoryRequest {
-        event_tx: event_tx,
+        server_inner,
         handle: handle,
         buffer: [0u8; BUF_SIZE as usize],
         data: rd.clone(),
@@ -297,13 +387,16 @@ fn start_read(rd: &ReadData, event_tx: Arc<Mutex<EventTx>>, handle: HANDLE) {
     }
 }
 
-fn send_pending_rename_event(event: Option<RawEvent>, event_tx: &mut EventTx) {
+fn send_pending_rename_event(event: Option<RawEvent>, x: &Arc<Mutex<ServerInner>>) {
     if let Some(e) = event {
-        event_tx.send(RawEvent {
-            path: e.path,
-            op: Ok(op::Op::REMOVE),
-            cookie: None,
-        });
+        send(
+            x,
+            RawEvent {
+                path: e.path,
+                op: Ok(op::Op::REMOVE),
+                cookie: None,
+            },
+        );
     }
 }
 
@@ -327,100 +420,104 @@ unsafe extern "system" fn handle_event(
 
 fn handle_event_inner(request: Box<ReadDirectoryRequest>) {
     // Get the next request queued up as soon as possible
-    start_read(&request.data, request.event_tx.clone(), request.handle);
+    start_read(&request.data, request.server_inner.clone(), request.handle);
 
-    let event_tx_lock = request.event_tx.lock();
-    if let Ok(mut event_tx) = event_tx_lock {
-        let mut rename_event = None;
+    let mut rename_event = None;
 
-        // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
-        // string as its last member.  Each struct contains an offset for getting the next entry in
-        // the buffer.
-        let mut cur_offset: *const u8 = request.buffer.as_ptr();
-        let mut cur_entry: &mut FILE_NOTIFY_INFORMATION = unsafe { mem::transmute(cur_offset) };
-        loop {
-            // filename length is size in bytes, so / 2
-            let len = cur_entry.FileNameLength as usize / 2;
-            let encoded_path: &[u16] =
-                unsafe { slice::from_raw_parts((*cur_entry).FileName.as_ptr(), len) };
-            // prepend root to get a full path
-            let path = request
-                .data
-                .dir
-                .join(PathBuf::from(OsString::from_wide(encoded_path)));
+    // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
+    // string as its last member.  Each struct contains an offset for getting the next entry in
+    // the buffer.
+    let mut cur_offset: *const u8 = request.buffer.as_ptr();
+    let mut cur_entry: &mut FILE_NOTIFY_INFORMATION = unsafe { mem::transmute(cur_offset) };
+    loop {
+        // filename length is size in bytes, so / 2
+        let len = cur_entry.FileNameLength as usize / 2;
+        let encoded_path: &[u16] =
+            unsafe { slice::from_raw_parts((*cur_entry).FileName.as_ptr(), len) };
+        // prepend root to get a full path
+        let path = request
+            .data
+            .dir
+            .join(PathBuf::from(OsString::from_wide(encoded_path)));
 
-            // if we are watching a single file, ignore the event unless the path is exactly
-            // the watched file
-            let skip = match request.data.file {
-                None => false,
-                Some(ref watch_path) => *watch_path != path,
-            };
+        // if we are watching a single file, ignore the event unless the path is exactly
+        // the watched file
+        let skip = match request.data.file {
+            None => false,
+            Some(ref watch_path) => *watch_path != path,
+        };
 
-            if !skip {
-                if cur_entry.Action == winnt::FILE_ACTION_RENAMED_OLD_NAME {
-                    send_pending_rename_event(rename_event, &mut event_tx);
-                    if request.data.file.is_some() {
-                        event_tx.send(RawEvent {
+        if !skip {
+            if cur_entry.Action == winnt::FILE_ACTION_RENAMED_OLD_NAME {
+                send_pending_rename_event(rename_event, &request.server_inner);
+                if request.data.file.is_some() {
+                    send(
+                        &request.server_inner,
+                        RawEvent {
                             path: Some(path),
                             op: Ok(op::Op::RENAME),
                             cookie: None,
-                        });
-                        rename_event = None;
-                    } else {
-                        unsafe {
-                            COOKIE_COUNTER = COOKIE_COUNTER.wrapping_add(1);
-                            rename_event = Some(RawEvent {
-                                path: Some(path),
-                                op: Ok(op::Op::RENAME),
-                                cookie: Some(COOKIE_COUNTER),
-                            });
-                        }
-                    }
+                        },
+                    );
+                    rename_event = None;
                 } else {
-                    let mut o = Op::empty();
-                    let mut c = None;
+                    unsafe {
+                        COOKIE_COUNTER = COOKIE_COUNTER.wrapping_add(1);
+                        rename_event = Some(RawEvent {
+                            path: Some(path),
+                            op: Ok(op::Op::RENAME),
+                            cookie: Some(COOKIE_COUNTER),
+                        });
+                    }
+                }
+            } else {
+                let mut o = Op::empty();
+                let mut c = None;
 
-                    match cur_entry.Action {
-                        winnt::FILE_ACTION_RENAMED_NEW_NAME => {
-                            if let Some(e) = rename_event {
-                                if let Some(cookie) = e.cookie {
-                                    event_tx.send(e);
-                                    o.insert(op::Op::RENAME);
-                                    c = Some(cookie);
-                                } else {
-                                    o.insert(op::Op::CREATE);
-                                }
+                match cur_entry.Action {
+                    winnt::FILE_ACTION_RENAMED_NEW_NAME => {
+                        if let Some(e) = rename_event {
+                            if let Some(cookie) = e.cookie {
+                                send(&request.server_inner, e);
+                                o.insert(op::Op::RENAME);
+                                c = Some(cookie);
                             } else {
                                 o.insert(op::Op::CREATE);
                             }
-                            rename_event = None;
+                        } else {
+                            o.insert(op::Op::CREATE);
                         }
-                        winnt::FILE_ACTION_ADDED => o.insert(op::Op::CREATE),
-                        winnt::FILE_ACTION_REMOVED => o.insert(op::Op::REMOVE),
-                        winnt::FILE_ACTION_MODIFIED => o.insert(op::Op::WRITE),
-                        _ => (),
-                    };
+                        rename_event = None;
+                    }
+                    winnt::FILE_ACTION_ADDED => o.insert(op::Op::CREATE),
+                    winnt::FILE_ACTION_REMOVED => o.insert(op::Op::REMOVE),
+                    winnt::FILE_ACTION_MODIFIED => o.insert(op::Op::WRITE),
+                    _ => (),
+                };
 
-                    send_pending_rename_event(rename_event, &mut event_tx);
-                    rename_event = None;
+                send_pending_rename_event(rename_event, &request.server_inner);
+                rename_event = None;
 
-                    event_tx.send(RawEvent {
+                send(
+                    &request.server_inner,
+                    RawEvent {
                         path: Some(path),
                         op: Ok(o),
                         cookie: c,
-                    });
-                }
+                    },
+                );
             }
-
-            if cur_entry.NextEntryOffset == 0 {
-                break;
-            }
-            cur_offset = unsafe { cur_offset.offset(cur_entry.NextEntryOffset as isize) };
-            cur_entry = unsafe { mem::transmute(cur_offset) };
         }
 
-        send_pending_rename_event(rename_event, &mut event_tx);
+        if cur_entry.NextEntryOffset == 0 {
+            break;
+        }
+        cur_offset = unsafe { cur_offset.offset(cur_entry.NextEntryOffset as isize) };
+        cur_entry = unsafe { mem::transmute(cur_offset) };
     }
+
+    send_pending_rename_event(rename_event, &request.server_inner);
+    process_pending_start_reads(&request.server_inner);
 }
 
 pub struct ReadDirectoryChangesWatcher {
@@ -446,7 +543,7 @@ impl ReadDirectoryChangesWatcher {
 
         let event_tx = EventTx::Raw { tx: tx };
 
-        let action_tx = ReadDirectoryChangesServer::start(event_tx, meta_tx, cmd_tx, wakeup_sem);
+        let action_tx = Server::start(event_tx, meta_tx, cmd_tx, wakeup_sem);
 
         Ok(ReadDirectoryChangesWatcher {
             tx: action_tx,
@@ -475,7 +572,7 @@ impl ReadDirectoryChangesWatcher {
             debounce: Debounce::new(delay, tx),
         };
 
-        let action_tx = ReadDirectoryChangesServer::start(event_tx, meta_tx, cmd_tx, wakeup_sem);
+        let action_tx = Server::start(event_tx, meta_tx, cmd_tx, wakeup_sem);
 
         Ok(ReadDirectoryChangesWatcher {
             tx: action_tx,

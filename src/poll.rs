@@ -34,36 +34,42 @@ pub struct PollWatcher {
     open: Arc<RwLock<bool>>,
 }
 
-fn walkdir<'a>(
+fn walkdir_for_each<F: FnMut(walkdir::DirEntry) -> ()>(
     dir: &Path,
-    recursive_mode: &'a RecursiveMode,
-) -> impl Iterator<Item = walkdir::DirEntry> + 'a {
-    let max_depth;
-    let follow_links;
+    recursive_mode: &RecursiveMode,
+    mut cb: F,
+) {
     match recursive_mode {
         RecursiveMode::Filtered(filter) => {
-            max_depth = usize::max_value();
-            follow_links = filter.follow_links;
+            for e in WalkDir::new(dir)
+                .follow_links(filter.follow_links)
+                .into_iter()
+                .filter_entry(|e| (filter.filter)(e.into()))
+                .filter_map(|e| e.ok())
+            {
+                cb(e)
+            }
         }
         RecursiveMode::Recursive => {
-            max_depth = usize::max_value();
-            follow_links = true;
+            for e in WalkDir::new(dir)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                cb(e)
+            }
         }
         RecursiveMode::NonRecursive => {
-            max_depth = 1;
-            follow_links = true;
+            for e in WalkDir::new(dir)
+                .follow_links(true)
+                .max_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                cb(e)
+            }
         }
     }
-
-    WalkDir::new(dir)
-        .follow_links(follow_links)
-        .max_depth(max_depth)
-        .into_iter()
-        .filter_entry(move |e| match recursive_mode {
-            RecursiveMode::Filtered(filter) => (filter.filter)(e.into()),
-            RecursiveMode::Recursive | RecursiveMode::NonRecursive => true,
-        })
-        .filter_map(|e| e.ok())
 }
 
 impl PollWatcher {
@@ -141,7 +147,7 @@ impl PollWatcher {
                                         }
                                     }
                                 } else {
-                                    for entry in walkdir(watch, recursive_mode) {
+                                    walkdir_for_each(watch, recursive_mode, |entry| {
                                         let path = entry.path();
 
                                         match entry.metadata() {
@@ -184,7 +190,7 @@ impl PollWatcher {
                                                 }
                                             }
                                         }
-                                    }
+                                    })
                                 }
                             }
                         }
@@ -267,12 +273,13 @@ impl Watcher for PollWatcher {
                         );
                     } else {
                         let mut paths = HashMap::new();
-                        for entry in walkdir(&watch, &recursive_mode) {
+                        let event_tx = &mut self.event_tx;
+                        walkdir_for_each(&watch, &recursive_mode, |entry| {
                             let path = entry.path();
 
                             match entry.metadata() {
                                 Err(e) => {
-                                    self.event_tx.send(RawEvent {
+                                    event_tx.send(RawEvent {
                                         path: Some(path.to_path_buf()),
                                         op: Err(Error::Io(e.into())),
                                         cookie: None,
@@ -289,7 +296,8 @@ impl Watcher for PollWatcher {
                                     );
                                 }
                             }
-                        }
+                        });
+
                         watches.insert(
                             watch,
                             WatchData {

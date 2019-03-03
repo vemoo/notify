@@ -66,10 +66,45 @@ fn filtered_setup<E, W: Watcher, F: FnOnce(mpsc::Sender<E>) -> Result<W>>(
 
 #[test]
 fn recommended_watcher_filtered() {
-    let (_tdir, _watcher, rx) = filtered_setup(RecommendedWatcher::new_raw, 10);
-    let evs = recv_events(&rx);
+    let (tdir, _watcher, rx) = filtered_setup(RecommendedWatcher::new_raw, 10);
 
-    println!("{:#?}", evs);
+    let actual = recv_events(&rx);
+    let cookies = extract_cookies(&actual);
+    if cfg!(target_os = "linux") {
+        let expected = vec![
+            (tdir.mkpath("dir1"), op::CREATE, None),
+            (tdir.mkpath("dir1/file1"), op::CREATE, None),
+            (tdir.mkpath("dir1/file1"), op::CLOSE_WRITE, None),
+            (tdir.mkpath("dir1/subdir1"), op::CREATE, None),
+            (tdir.mkpath("dir1/subdir1/file1"), op::CREATE, None),
+            (tdir.mkpath("dir1/subdir1/file1"), op::CLOSE_WRITE, None),
+            (tdir.mkpath("dir1/subdir1/file2"), op::CREATE, None),
+            (tdir.mkpath("dir1/subdir1/file2"), op::CLOSE_WRITE, None),
+            (tdir.mkpath("dir1/subdir2"), op::CREATE, None),
+            (tdir.mkpath("dir1/subdir2/subdir1"), op::CREATE, None),
+            (tdir.mkpath("dir1/subdir2/subdir1/file1"), op::CREATE, None),
+            (
+                tdir.mkpath("dir1/subdir2/subdir1/file1"),
+                op::CLOSE_WRITE,
+                None,
+            ),
+            (
+                tdir.mkpath("dir1/non_ignored_dir"),
+                op::RENAME,
+                Some(cookies[0]),
+            ),
+            (tdir.mkpath("dir1/subdir2"), op::RENAME, Some(cookies[1])),
+        ];
+
+        // assert this way to make it easier to figure out what went wrong when it fails
+        for (a, e) in actual.iter().zip(&expected) {
+            assert_eq!(a, e);
+        }
+        assert_eq!(actual.len(), expected.len());
+    } else {
+        // TODO assert
+        println!("{:#?}", actual);
+    }
 }
 
 #[test]

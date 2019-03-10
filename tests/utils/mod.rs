@@ -254,3 +254,12 @@ macro_rules! assert_eq_any {
         }
     })
 }
+
+macro_rules! assert_eq_iter {
+    ($actual:expr, $expected:expr) => {{
+        for (a, e) in $actual.iter().zip(&$expected) {
+            assert_eq!(a, e);
+        }
+        assert_eq!($actual.len(), $expected.len());
+    }};
+}

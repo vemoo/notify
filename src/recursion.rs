@@ -34,6 +34,7 @@ pub struct RecursionFilter {
     pub follow_links: bool,
 }
 
+#[derive(Clone, Debug)]
 struct EventInfo {
     path: PathBuf,
     file_type: Option<fs::FileType>,

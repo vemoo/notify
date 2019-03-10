@@ -1,6 +1,7 @@
 extern crate notify;
 extern crate tempdir;
 
+#[macro_use]
 mod utils;
 
 use notify::*;
@@ -32,6 +33,8 @@ fn filtered_setup<E, W: Watcher, F: FnOnce(mpsc::Sender<E>) -> Result<W>>(
     watcher
         .watch(tdir.mkpath("."), RecursiveMode::Filtered(filter))
         .expect("failed to watch directory");
+
+    sleep_windows(100);
 
     let files = vec![
         "dir1",
@@ -65,7 +68,7 @@ fn filtered_setup<E, W: Watcher, F: FnOnce(mpsc::Sender<E>) -> Result<W>>(
 }
 
 #[test]
-fn recommended_watcher_filtered() {
+fn recommended_watcher_filtered_raw() {
     let (tdir, _watcher, rx) = filtered_setup(RecommendedWatcher::new_raw, 10);
 
     let actual = recv_events(&rx);
@@ -97,10 +100,7 @@ fn recommended_watcher_filtered() {
         ];
 
         // assert this way to make it easier to figure out what went wrong when it fails
-        for (a, e) in actual.iter().zip(&expected) {
-            assert_eq!(a, e);
-        }
-        assert_eq!(actual.len(), expected.len());
+        assert_eq_iter!(actual, expected);
     } else {
         // TODO assert
         println!("{:#?}", actual);
